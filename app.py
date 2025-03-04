@@ -5,14 +5,13 @@ import sys
 import termios
 import tty
 from getpass import getpass
-from typing import Dict, List
 
 from dotenv import load_dotenv
 from openai import Client
 from rich.console import Console
-from rich.live import Live
 from rich.table import Table
-from rich.text import Text
+
+from tokens import RichToken, format_rich_tokens_text
 
 load_dotenv()
 model_name = os.getenv("OPENAI_MODEL_NAME")
@@ -39,19 +38,7 @@ def get_prompt_with_history(prompt: str) -> str:
         return "exit"
 
 
-class TokenInfo:
-    def __init__(self, token: str, logprob: float, alternatives: List[Dict]):
-        self.token = token
-        self.logprob = logprob
-        self.alternatives = alternatives
-
-
-# Global storage for token information
-token_registry = {}
-current_token_id = 0
-
-
-def fetch_llm_response(prompt: str):
+def fetch_llm_response(prompt: str, n=1):
     client = Client(
         api_key=os.getenv("OPENAI_API_KEY"),
         base_url=os.getenv("OPENAI_BASE_URL"),
@@ -65,41 +52,13 @@ def fetch_llm_response(prompt: str):
         logprobs=True,
         top_logprobs=10,
         stream=False,
+        n=n,
     )
 
 
-def map_logprob_to_color(logprob):
-    # Return default color if logprob is None
-    if logprob is None:
-        return "white"
-
-    # Convert logprob to probability (0 to 1 scale)
-    prob = math.exp(logprob)
-
-    # Calculate red and green components
-    # When prob = 0.5, both red and green will be 128
-    # When prob = 0, red will be 255 and green will be 0
-    # When prob = 1, red will be 0 and green will be 255
-    red = int(255 * (1 - prob))
-    green = int(255 * prob)
-
-    return f"rgb({red},{green},0)"
-
-
-def format_token(token: str) -> str:
-    """Format token to show whitespace characters"""
-    replacements = {
-        " ": "␣",  # Space
-        "\n": "↵",  # Newline
-        "\t": "⇥",  # Tab
-        "\r": "⏎",  # Carriage return
-    }
-    return "".join(replacements.get(c, c) for c in token)
-
-
-def show_alternatives(token_info: TokenInfo):
+def show_alternatives(token_info: RichToken):
     """Display alternative tokens in a pretty table"""
-    table = Table(title=f"Alternatives for '{format_token(token_info.token)}'")
+    table = Table(title=f"Alternatives for '{token_info.to_printable()}'")
     table.add_column("Token", style="cyan")
     table.add_column("Visual", style="blue")
     table.add_column("Probability", style="magenta")
@@ -108,14 +67,14 @@ def show_alternatives(token_info: TokenInfo):
     main_prob = math.exp(token_info.logprob)
     table.add_row(
         repr(token_info.token),
-        format_token(token_info.token),
+        token_info.to_printable(),
         f"{main_prob:.4f} (selected)",
     )
 
     # Add alternative tokens
-    for alt in token_info.alternatives:
+    for alt in token_info.top_logprobs:
         prob = math.exp(alt.logprob)
-        table.add_row(repr(alt.token), format_token(alt.token), f"{prob:.4f}")
+        table.add_row(repr(alt.token), alt.to_printable(), f"{prob:.4f}")
 
     console.print(table)
 
@@ -133,34 +92,12 @@ def get_key():
 
 
 def display_response_with_color(response):
-    global current_token_id
-    token_registry.clear()
-    current_token_id = 0
     selected_index = 0
 
-    # Store tokens for navigation
-    tokens = []
-    content_logprobs = response.choices[0].logprobs.content
-
-    for token_info in content_logprobs:
-        token_id = f"token_{current_token_id}"
-        token_registry[token_id] = TokenInfo(
-            token=token_info.token,
-            logprob=token_info.logprob,
-            alternatives=token_info.top_logprobs[1:],
-        )
-        tokens.append((token_info, token_id))
-        current_token_id += 1
+    tokens = RichToken.from_logprobs(response.choices[0].logprobs.content)
 
     while True:
-        # Display tokens with current selection highlighted
-        styled_text = Text()
-        for i, (token_info, token_id) in enumerate(tokens):
-            main_color = map_logprob_to_color(token_info.logprob)
-            style = f"{main_color}"
-            if i == selected_index:
-                style += " reverse"  # Highlight selected token
-            styled_text.append(token_info.token, style=style)
+        styled_text = format_rich_tokens_text(tokens, selected_index)
 
         # Clear screen and show current state
         console.clear()
@@ -180,9 +117,8 @@ def display_response_with_color(response):
         elif key in ("q", "Q", "ქ"):  # Quit
             break
         elif key == "\r":  # Enter
-            token_id = tokens[selected_index][1]
             console.print("\n")
-            show_alternatives(token_registry[token_id])
+            show_alternatives(tokens[selected_index])
             getpass("\nPress Enter to continue...")
 
 
